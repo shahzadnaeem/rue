@@ -1,5 +1,9 @@
 use std::{
-    collections::HashMap, ffi::c_void, mem, os::unix::process::CommandExt, process::Command, str,
+    collections::{HashMap, VecDeque},
+    ffi::c_void,
+    mem,
+    os::unix::process::CommandExt,
+    process::Command,
 };
 
 use nix::{
@@ -18,11 +22,36 @@ pub enum PathArg {
     Rsi,
 }
 
+pub fn get_command() -> Command {
+    let mut cmd_args = std::env::args()
+        .into_iter()
+        .skip(1)
+        .collect::<VecDeque<String>>();
+
+    eprintln!("Args: {:?}", cmd_args);
+
+    if let Some(prog) = cmd_args.pop_front() {
+        let mut cmd = Command::new(prog);
+        for arg in cmd_args {
+            cmd.arg(arg);
+        }
+
+        cmd
+    } else {
+        let mut cmd = Command::new("cat");
+        cmd.arg("./small.hosts");
+
+        cmd
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let syscall_table = build_syscall_table();
 
-    let mut command = Command::new("cat");
-    command.arg("./small.hosts");
+    let mut command = get_command();
+
+    eprintln!("Command: {:?}", command);
+
     unsafe {
         command.pre_exec(|| {
             use nix::sys::ptrace::traceme;
@@ -36,34 +65,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("first wait: {:?}", res.yellow());
 
     let mut is_sys_exit = false;
+
     loop {
         ptrace::syscall(child_pid, None)?;
         _ = waitpid(child_pid, None)?;
         if is_sys_exit {
-            let regs = ptrace::getregs(child_pid)?;
+            if let Ok(regs) = ptrace::getregs(child_pid) {
+                let file_arg_no = syscall_table[&regs.orig_rax].1;
 
-            let file_arg_no = syscall_table[&regs.orig_rax].1;
+                let path = if file_arg_no == Some(PathArg::Rdi) {
+                    get_string_from_addr(child_pid, regs.rdi)
+                } else if file_arg_no == Some(PathArg::Rsi) {
+                    get_string_from_addr(child_pid, regs.rsi)
+                } else {
+                    format!("")
+                };
 
-            let path = if file_arg_no == Some(PathArg::Rdi) {
-                get_string_from_addr(child_pid, regs.rdi)
-            } else if file_arg_no == Some(PathArg::Rsi) {
-                get_string_from_addr(child_pid, regs.rsi)
+                eprintln!(
+                    "{}({:x}, {:x}{}, {:x}, ...) = {:x}",
+                    syscall_table[&regs.orig_rax].0.green(),
+                    regs.rdi.blue(),
+                    regs.rsi.blue(),
+                    path.green(),
+                    regs.rdx.blue(),
+                    regs.rax.yellow(),
+                );
             } else {
-                format!("")
-            };
-
-            eprintln!(
-                "{}({:x}, {:x}{}, {:x}, ...) = {:x}",
-                syscall_table[&regs.orig_rax].0.green(),
-                regs.rdi.blue(),
-                regs.rsi.blue(),
-                path.green(),
-                regs.rdx.blue(),
-                regs.rax.yellow(),
-            );
+                break;
+            }
         }
         is_sys_exit = !is_sys_exit;
     }
+
+    Ok(())
 }
 
 pub fn build_syscall_table() -> HashMap<u64, (String, Option<PathArg>)> {
@@ -79,12 +113,14 @@ pub fn build_syscall_table() -> HashMap<u64, (String, Option<PathArg>)> {
         .map(|item| {
             let mut idx: Option<PathArg> = None;
 
+            // TODO: Not all strings are NULL terminated - eg read has a size_t count param following the string
+
             let filename_arg_idx = if let Value::Array(ary) = item {
                 if let Some(Value::String(v)) = ary[RDI_IDX].get("type") {
-                    if v.contains("const char __user * filename") {
+                    if v.contains("char __user *") {
                         idx = Some(PathArg::Rdi);
                     } else if let Some(Value::String(v)) = ary[RSI_IDX].get("type") {
-                        if v.contains("const char __user * filename") {
+                        if v.contains("char __user *") {
                             idx = Some(PathArg::Rsi);
                         }
                     }
@@ -106,24 +142,36 @@ pub fn build_syscall_table() -> HashMap<u64, (String, Option<PathArg>)> {
 }
 
 pub fn get_string_from_addr(pid: Pid, addr: u64) -> String {
-    let mut full_path = String::new();
+    const MAX_STRING_LEN: usize = 48;
+
+    let full_path: String;
     let mut addr = addr;
+
+    let mut all_bytes: Vec<u8> = Vec::with_capacity(64);
 
     loop {
         let w1 = ptrace::read(pid, addr as *mut c_void);
 
         if let Ok(pp) = w1 {
-            let bytes = pp
+            let mut bytes = pp
                 .to_le_bytes()
                 .into_iter()
                 .take_while(|b| *b != 0u8)
                 .collect::<Vec<_>>();
 
-            full_path.push_str(str::from_utf8(&bytes).unwrap());
+            let num_bytes = bytes.len();
+
+            all_bytes.append(&mut bytes);
 
             addr += mem::size_of::<u64>() as u64;
 
-            if bytes.len() < mem::size_of::<u64>() {
+            if num_bytes < mem::size_of::<u64>() || all_bytes.len() > MAX_STRING_LEN {
+                if num_bytes == mem::size_of::<u64>() {
+                    let mut dot_dot_dot = " ...".as_bytes().to_vec();
+                    all_bytes.append(&mut dot_dot_dot);
+                }
+
+                full_path = String::from_utf8_lossy(&all_bytes).to_string();
                 break;
             }
         } else {
